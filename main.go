@@ -1,62 +1,152 @@
-// Writing a basic HTTP server is easy using the
-// `net/http` package.
 package main
 
 import (
-	"os"
-	"fmt"
-	"net/http"
-	"encoding/csv"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"github.com/gorilla/mux"
+	log "github.com/sirupsen/logrus"
+	"net/http"
 )
 
-type json_req_body struct {
-	File_Name string `json:"file_name"`
-	Parameter_Values string `json:"parameter_values"`
-	Candlestick_Interval string `json:"candlestick_interval"`
-	Other string `json:"other"`
-	Commit_Hash string `json:"commit_hash"`
-	Symbol string `json:"symbol"`
-	Perc_Profitable string `json:"perc_profitable"`
-	N_Trades string `json:"n_trades"`
-	Sharpe_Ratio string `json:"sharpe_ratio"`
+func SHA256(text string) string {
+	data := []byte(text)
+	return fmt.Sprintf("%x", sha256.Sum256(data))
 }
 
+var (
+	registeredVoters         = make(map[string]string)
+	loginAttempts            = make(map[string][]int)
+	sessionStore, sessionErr = NewRediStore(10, "tcp", ":6379", "", []byte("secret-key"))
+)
 
-// A fundamental concept in `net/http` servers is
-// *handlers*. A handler is an object implementing the
-// `http.Handler` interface. A common way to write
-// a handler is by using the `http.HandlerFunc` adapter
-// on functions with the appropriate signature.
-func submit(w http.ResponseWriter, req *http.Request) {
-	path := "strategy_comparison.csv"
-	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		fmt.Fprintf(w, "Error opening %s: %v", path, err)
+type requestBody1x1 struct {
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+	Password  string `json:"password"`
+}
+
+type errorResponseBody1x1 struct {
+	Error string `json:"error"`
+}
+
+func writeErrorResponse1x1(res http.ResponseWriter, errorName string, statusCode int) {
+	errorResponse := errorResponseBody1x1{Error: errorName}
+	res.WriteHeader(statusCode)
+	jsonErr := json.NewEncoder(res).Encode(errorResponse)
+	if jsonErr != nil {
+		log.Warnf("%s caused %s when writing reponse", errorName, jsonErr)
+	}
+}
+
+func writeErrorResponse1x2(res http.ResponseWriter, err error, statusCode int) {
+	errorResponse := errorResponseBody1x1{Error: error.Error(err)}
+	res.WriteHeader(statusCode)
+	jsonErr := json.NewEncoder(res).Encode(errorResponse)
+	if jsonErr != nil {
+		log.Warnf("Failed login caused '%s' when writing reponse", jsonErr)
+	}
+}
+
+func writeResponse1x1(res http.ResponseWriter, statusCode int) {
+	res.WriteHeader(statusCode)
+}
+
+func writeResponse1x2(res http.ResponseWriter, statusCode int) {
+	res.WriteHeader(statusCode)
+}
+
+func registerVoter(reqBody requestBody1x1) {
+	fullName := reqBody.FirstName + " " + reqBody.LastName
+	registeredVoters[fullName] = SHA256(reqBody.Password)
+	loginAttempts[fullName] = []int{0}
+}
+
+func register(res http.ResponseWriter, req *http.Request) {
+	decoder := json.NewDecoder(req.Body)
+	reqBody := requestBody1x1{}
+	if jsonDecodeErr := decoder.Decode(&reqBody); jsonDecodeErr != nil {
+		writeErrorResponse1x1(res, "Invalid JSON", 400)
+	} else if userExists(reqBody) {
+		writeErrorResponse1x1(res, "User already registered", 409)
+	} else if !Verify(reqBody.Password) {
+		writeErrorResponse1x1(res, "Invalid Password", 400)
 	} else {
-		writer := csv.NewWriter(file)
-		decoder := json.NewDecoder(req.Body)
-    	var req_body json_req_body
-    	json_decode_err := decoder.Decode(&req_body)
-   		if json_decode_err != nil {
-			fmt.Fprintf(w, "Json decode error: %v", err)
-    	} else {
-			csv_records := []string{req_body.File_Name, req_body.Parameter_Values, req_body.Candlestick_Interval, req_body.Other, 
-				req_body.Commit_Hash, req_body.Symbol, req_body.Perc_Profitable, req_body.N_Trades, req_body.Sharpe_Ratio}
-			writer.Write(csv_records) 
-			writer.Flush()
-			if err := writer.Error(); err != nil {
-				fmt.Fprintf(w, "IO error: %v", err)
-			} else {
-				fmt.Fprintf(w, "Success: %s", req_body.Symbol)
-			}
+		registerVoter(reqBody)
+		writeResponse1x2(res, 204)
+	}
+}
+
+func tryLogin(req *http.Request, reqBody requestBody1x1) error {
+	fullName := reqBody.FirstName + " " + reqBody.LastName
+	savedPwdHash, exists := registeredVoters[fullName]
+	receivedPwHash := SHA256(reqBody.Password)
+	if !exists || savedPwdHash != receivedPwHash {
+		return errors.New("user does not exist or password is incorrect")
+	}
+	session, err := sessionStore.Get(req, "my-cookie-store")
+	if err != nil {
+		return err
+	}
+	session.Values["authenticated"] = true
+	return nil
+}
+
+func userExists(reqBody requestBody1x1) bool {
+	fullName := reqBody.FirstName + " " + reqBody.LastName
+	_, exists := registeredVoters[fullName]
+	return exists
+}
+
+func login(res http.ResponseWriter, req *http.Request) {
+	decoder := json.NewDecoder(req.Body)
+	reqBody := requestBody1x1{}
+	if jsonDecodeErr := decoder.Decode(&reqBody); jsonDecodeErr != nil {
+		writeErrorResponse1x1(res, "Invalid JSON", 400)
+	} else {
+		if err := tryLogin(req, reqBody); err != nil {
+			writeErrorResponse1x2(res, err, 401)
+		} else {
+			writeResponse1x2(res, 204)
 		}
 	}
 }
 
-func main() {
-	http.HandleFunc("/submit", submit)
-
-	http.ListenAndServe(":8090", nil)
+func home(res http.ResponseWriter, req *http.Request) {
+	session, err := sessionStore.Get(req, "my-cookie-store")
+	if err != nil {
+		http.Error(res, "Forbidden", http.StatusForbidden)
+	} else if auth, ok := session.Values["authenticated"].(bool); !ok || !auth {
+		http.Error(res, "Forbidden", http.StatusForbidden)
+	} else {
+		_, _ = res.Write([]byte("Welcome home honey"))
+	}
 }
 
+func main() {
+	if sessionErr != nil {
+		log.Fatalf("Could not connect to session store")
+	} else {
+		defer func(sessionStore *RediStore) {
+			err := sessionStore.Close()
+			if err != nil {
+				log.Fatalf("Could not close session store")
+			}
+			router := mux.NewRouter()
+
+			router.Path("/register").Methods("POST").HandlerFunc(register)
+
+			router.Path("/login").Methods("POST").HandlerFunc(login)
+
+			router.Path("/home").Methods("POST").HandlerFunc(home)
+
+			port := ":8090"
+			log.Info("Server listening on port ", port)
+			if err := http.ListenAndServe(port, router); err != nil {
+				log.Fatalf("Server failed to start: %v", err)
+			}
+
+		}(sessionStore)
+	}
+}
